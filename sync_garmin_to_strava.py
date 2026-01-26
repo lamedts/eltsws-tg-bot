@@ -121,6 +121,44 @@ def get_garmin_latest_activity(garmin: Garmin) -> dict | None:
         return None
 
 
+def get_garmin_activities_since(garmin: Garmin, hours: int = 24) -> list:
+    """Get all Garmin activities from the past N hours."""
+    from datetime import datetime, timedelta
+
+    try:
+        # Get more activities to ensure we cover the time range
+        activities = garmin.get_activities(0, 20)
+        if not activities:
+            return []
+
+        cutoff_time = datetime.now() - timedelta(hours=hours)
+        recent_activities = []
+
+        for activity in activities:
+            try:
+                time_str = activity.get("startTimeLocal", "")
+                activity_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+                if activity_time >= cutoff_time:
+                    recent_activities.append(activity)
+            except (ValueError, TypeError):
+                continue
+
+        return recent_activities
+    except Exception as e:
+        print(f"❌ Error fetching Garmin activities: {e}")
+        return []
+
+
+def get_garmin_activities(garmin: Garmin, count: int = 10) -> list:
+    """Get the last N activities from Garmin Connect."""
+    try:
+        activities = garmin.get_activities(0, count)
+        return activities if activities else []
+    except Exception as e:
+        print(f"❌ Error fetching Garmin activities: {e}")
+        return []
+
+
 # ===== Strava Functions =====
 
 def get_strava_credentials(interactive: bool = True):

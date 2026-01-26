@@ -31,7 +31,8 @@ load_dotenv()
 # Import sync functions from existing script
 from sync_garmin_to_strava import (
     init_garmin_api,
-    get_garmin_latest_activity,
+    get_garmin_activities_since,
+    get_garmin_activities,
     get_strava_credentials,
     get_strava_access_token,
     get_strava_activities,
@@ -52,16 +53,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "🔄 *Garmin to Strava Sync Bot*\n\n"
         "Commands:\n"
-        "/sync - Sync latest Garmin activity title to Strava\n\n"
-        "This bot reads your latest Garmin activity and updates "
-        "the matching Strava activity with the same title.",
+        "/sync - Sync activities from past 24 hours\n"
+        "/sync\\_last\\_10 - Sync the last 10 activities\n\n"
+        "This bot syncs activity titles from Garmin to Strava.",
         parse_mode="Markdown"
     )
 
 
 async def sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /sync command - sync latest Garmin activity title to Strava."""
-    await update.message.reply_text("🔄 Starting sync...")
+    """Handle /sync command - sync all Garmin activities from past 24 hours to Strava."""
+    await update.message.reply_text("🔄 Syncing activities from past 24 hours...")
 
     try:
         # Step 1: Connect to Garmin
@@ -71,73 +72,151 @@ async def sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("❌ Failed to connect to Garmin.")
             return
 
-        # Step 2: Get latest Garmin activity
-        garmin_activity = get_garmin_latest_activity(garmin)
-        if not garmin_activity:
-            await update.message.reply_text("❌ No Garmin activities found.")
+        # Step 2: Get Garmin activities from past 24 hours
+        garmin_activities = get_garmin_activities_since(garmin, hours=24)
+        if not garmin_activities:
+            await update.message.reply_text("❌ No Garmin activities found in the past 24 hours.")
             return
 
-        garmin_name = garmin_activity.get("activityName", "Unknown")
-        garmin_time = garmin_activity.get("startTimeLocal", "Unknown")
-        garmin_distance = garmin_activity.get("distance", 0) / 1000
-
-        await update.message.reply_text(
-            f"📋 *Latest Garmin Activity:*\n"
-            f"• Name: {garmin_name}\n"
-            f"• Time: {garmin_time}\n"
-            f"• Distance: {garmin_distance:.2f} km",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text(f"📋 Found {len(garmin_activities)} Garmin activities in past 24 hours")
 
         # Step 3: Connect to Strava
         await update.message.reply_text("🏃 Connecting to Strava...")
         client_id, client_secret = get_strava_credentials(interactive=False)
         access_token = get_strava_access_token(client_id, client_secret)
 
-        # Step 4: Get Strava activities and find match
-        strava_activities = get_strava_activities(access_token, count=10)
+        # Step 4: Get Strava activities
+        strava_activities = get_strava_activities(access_token, count=20)
         if not strava_activities:
             await update.message.reply_text("❌ No Strava activities found.")
             return
 
-        matching_strava = find_matching_strava_activity(garmin_activity, strava_activities)
-        if not matching_strava:
-            await update.message.reply_text(
-                "❌ No matching Strava activity found.\n\n"
-                "Recent Strava activities:\n" +
-                "\n".join([f"• {a.get('name')}" for a in strava_activities[:5]])
-            )
-            return
+        # Step 5: Process each Garmin activity
+        synced_count = 0
+        skipped_count = 0
+        not_found_count = 0
+        results = []
 
-        strava_name = matching_strava.get("name", "Unknown")
-        strava_id = matching_strava.get("id")
-        strava_distance = matching_strava.get("distance", 0) / 1000
+        for garmin_activity in garmin_activities:
+            garmin_name = garmin_activity.get("activityName", "Unknown")
+            garmin_time = garmin_activity.get("startTimeLocal", "Unknown")
 
-        # Step 5: Check if update needed
-        if strava_name == garmin_name:
-            await update.message.reply_text(
-                f"✅ Titles already match!\n"
-                f"📝 Title: {strava_name}"
-            )
-            return
+            # Find matching Strava activity
+            matching_strava = find_matching_strava_activity(garmin_activity, strava_activities)
 
-        # Step 6: Update Strava
-        await update.message.reply_text(
-            f"📝 *Updating title:*\n"
-            f"• From: {strava_name}\n"
-            f"• To: {garmin_name}",
-            parse_mode="Markdown"
+            if not matching_strava:
+                not_found_count += 1
+                results.append(f"❓ {garmin_name} - No match found")
+                continue
+
+            strava_name = matching_strava.get("name", "Unknown")
+            strava_id = matching_strava.get("id")
+
+            # Check if update needed
+            if strava_name == garmin_name:
+                skipped_count += 1
+                results.append(f"✅ {garmin_name} - Already synced")
+                continue
+
+            # Update Strava
+            try:
+                update_strava_activity(access_token, strava_id, garmin_name)
+                synced_count += 1
+                results.append(f"🔄 {strava_name} → {garmin_name}")
+            except Exception as e:
+                results.append(f"❌ {garmin_name} - Error: {e}")
+
+        # Send summary
+        summary = (
+            f"*Sync Complete!*\n\n"
+            f"✅ Synced: {synced_count}\n"
+            f"⏭️ Already matched: {skipped_count}\n"
+            f"❓ No match found: {not_found_count}\n\n"
+            f"*Details:*\n" + "\n".join(results)
         )
 
-        updated = update_strava_activity(access_token, strava_id, garmin_name)
+        await update.message.reply_text(summary, parse_mode="Markdown")
 
-        await update.message.reply_text(
-            f"✅ *Success!*\n\n"
-            f"Old: {strava_name}\n"
-            f"New: {updated.get('name')}\n\n"
-            f"🔗 [View on Strava](https://www.strava.com/activities/{strava_id})",
-            parse_mode="Markdown"
+    except Exception as e:
+        logger.exception("Error during sync")
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
+async def sync_last_10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /sync_last_10 command - sync the last 10 Garmin activities to Strava."""
+    await update.message.reply_text("🔄 Syncing last 10 activities...")
+
+    try:
+        # Step 1: Connect to Garmin
+        await update.message.reply_text("📱 Connecting to Garmin Connect...")
+        garmin = init_garmin_api()
+        if not garmin:
+            await update.message.reply_text("❌ Failed to connect to Garmin.")
+            return
+
+        # Step 2: Get last 10 Garmin activities
+        garmin_activities = get_garmin_activities(garmin, count=10)
+        if not garmin_activities:
+            await update.message.reply_text("❌ No Garmin activities found.")
+            return
+
+        await update.message.reply_text(f"📋 Found {len(garmin_activities)} Garmin activities")
+
+        # Step 3: Connect to Strava
+        await update.message.reply_text("🏃 Connecting to Strava...")
+        client_id, client_secret = get_strava_credentials(interactive=False)
+        access_token = get_strava_access_token(client_id, client_secret)
+
+        # Step 4: Get Strava activities
+        strava_activities = get_strava_activities(access_token, count=20)
+        if not strava_activities:
+            await update.message.reply_text("❌ No Strava activities found.")
+            return
+
+        # Step 5: Process each Garmin activity
+        synced_count = 0
+        skipped_count = 0
+        not_found_count = 0
+        results = []
+
+        for garmin_activity in garmin_activities:
+            garmin_name = garmin_activity.get("activityName", "Unknown")
+
+            # Find matching Strava activity
+            matching_strava = find_matching_strava_activity(garmin_activity, strava_activities)
+
+            if not matching_strava:
+                not_found_count += 1
+                results.append(f"❓ {garmin_name} - No match")
+                continue
+
+            strava_name = matching_strava.get("name", "Unknown")
+            strava_id = matching_strava.get("id")
+
+            # Check if update needed
+            if strava_name == garmin_name:
+                skipped_count += 1
+                results.append(f"✅ {garmin_name}")
+                continue
+
+            # Update Strava
+            try:
+                update_strava_activity(access_token, strava_id, garmin_name)
+                synced_count += 1
+                results.append(f"🔄 {strava_name} → {garmin_name}")
+            except Exception as e:
+                results.append(f"❌ {garmin_name} - Error")
+
+        # Send summary
+        summary = (
+            f"*Sync Complete!*\n\n"
+            f"✅ Synced: {synced_count}\n"
+            f"⏭️ Already matched: {skipped_count}\n"
+            f"❓ No match: {not_found_count}\n\n"
+            f"*Details:*\n" + "\n".join(results)
         )
+
+        await update.message.reply_text(summary, parse_mode="Markdown")
 
     except Exception as e:
         logger.exception("Error during sync")
@@ -163,6 +242,7 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("sync", sync))
+    application.add_handler(CommandHandler("sync_last_10", sync_last_10))
 
     # Run the bot
     application.run_polling(allowed_updates=Update.ALL_TYPES)
