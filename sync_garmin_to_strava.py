@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """🔄 Garmin to Strava Activity Title Sync
 ==========================================
 
@@ -37,6 +38,7 @@ from garminconnect import (
     Garmin,
     GarminConnectAuthenticationError,
     GarminConnectConnectionError,
+    GarminConnectTooManyRequestsError,
 )
 
 # Load environment variables from .env file
@@ -58,6 +60,39 @@ STRAVA_API_BASE = "https://www.strava.com/api/v3"
 
 # ===== Garmin Functions =====
 
+def garmin_api_call(fn, *args, retries=3, **kwargs):
+    """Call a Garmin API method with retry and exponential backoff on rate limits."""
+    for attempt in range(retries):
+        try:
+            return fn(*args, **kwargs)
+        except GarminConnectTooManyRequestsError:
+            if attempt < retries - 1:
+                wait = 30 * (2 ** attempt)  # 30s, 60s, 120s
+                print(f"⏳ Garmin rate limit hit, waiting {wait}s before retry ({attempt + 1}/{retries})...")
+                time.sleep(wait)
+            else:
+                raise
+        except GarthHTTPError as e:
+            error_str = str(e)
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status == 429 or "429" in error_str:
+                if attempt < retries - 1:
+                    wait = 30 * (2 ** attempt)
+                    print(f"⏳ Garmin rate limit hit, waiting {wait}s before retry ({attempt + 1}/{retries})...")
+                    time.sleep(wait)
+                else:
+                    raise
+            elif status in (500, 503) or "500" in error_str or "503" in error_str:
+                if attempt < retries - 1:
+                    wait = 5 * (2 ** attempt)  # 5s, 10s, 20s
+                    print(f"⏳ Garmin server error, waiting {wait}s before retry ({attempt + 1}/{retries})...")
+                    time.sleep(wait)
+                else:
+                    raise
+            else:
+                raise
+
+
 def get_garmin_credentials():
     """Get Garmin credentials from environment or user input."""
     email = os.getenv("EMAIL")
@@ -71,6 +106,31 @@ def get_garmin_credentials():
     return email, password
 
 
+def _login_with_retry(login_fn, *args, retries=3, **kwargs):
+    """Retry a Garmin login call with exponential backoff on rate limits."""
+    for attempt in range(retries):
+        try:
+            return login_fn(*args, **kwargs)
+        except GarminConnectTooManyRequestsError:
+            if attempt < retries - 1:
+                wait = 60 * (2 ** attempt)  # 60s, 120s, 240s
+                print(f"⏳ Garmin login rate limit hit, waiting {wait}s before retry ({attempt + 1}/{retries})...")
+                time.sleep(wait)
+            else:
+                raise
+        except GarthHTTPError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status == 429 or "429" in str(e):
+                if attempt < retries - 1:
+                    wait = 60 * (2 ** attempt)
+                    print(f"⏳ Garmin login rate limit hit, waiting {wait}s before retry ({attempt + 1}/{retries})...")
+                    time.sleep(wait)
+                else:
+                    raise
+            else:
+                raise
+
+
 def init_garmin_api() -> Garmin | None:
     """Initialize Garmin API with authentication and token management."""
     tokenstore_path = GARMIN_TOKEN_DIR
@@ -78,7 +138,7 @@ def init_garmin_api() -> Garmin | None:
     # Try to login with stored tokens first
     try:
         garmin = Garmin()
-        garmin.login(str(tokenstore_path))
+        _login_with_retry(garmin.login, str(tokenstore_path))
         print("✅ Garmin: Using existing tokens")
         return garmin
     except (FileNotFoundError, GarthHTTPError, GarminConnectAuthenticationError, GarminConnectConnectionError):
@@ -90,7 +150,7 @@ def init_garmin_api() -> Garmin | None:
         try:
             email, password = get_garmin_credentials()
             garmin = Garmin(email=email, password=password, is_cn=False, return_on_mfa=True)
-            result1, result2 = garmin.login()
+            result1, result2 = _login_with_retry(garmin.login)
 
             if result1 == "needs_mfa":
                 mfa_code = input("Enter MFA code: ")
@@ -112,7 +172,7 @@ def init_garmin_api() -> Garmin | None:
 def get_garmin_latest_activity(garmin: Garmin) -> dict | None:
     """Get the latest activity from Garmin Connect."""
     try:
-        activities = garmin.get_activities(0, 1)
+        activities = garmin_api_call(garmin.get_activities, 0, 1)
         if activities:
             return activities[0]
         return None
@@ -127,7 +187,7 @@ def get_garmin_activities_since(garmin: Garmin, hours: int = 24) -> list:
 
     try:
         # Get more activities to ensure we cover the time range
-        activities = garmin.get_activities(0, 20)
+        activities = garmin_api_call(garmin.get_activities, 0, 20)
         if not activities:
             return []
 
@@ -152,7 +212,7 @@ def get_garmin_activities_since(garmin: Garmin, hours: int = 24) -> list:
 def get_garmin_activities(garmin: Garmin, count: int = 10) -> list:
     """Get the last N activities from Garmin Connect."""
     try:
-        activities = garmin.get_activities(0, count)
+        activities = garmin_api_call(garmin.get_activities, 0, count)
         return activities if activities else []
     except Exception as e:
         print(f"❌ Error fetching Garmin activities: {e}")
@@ -321,25 +381,42 @@ def get_strava_access_token(client_id: str, client_secret: str) -> str:
     return tokens["access_token"]
 
 
+def strava_api_call(method: str, url: str, retries: int = 3, **kwargs) -> requests.Response:
+    """Make a Strava API request with retry and backoff on rate limits (429)."""
+    for attempt in range(retries):
+        response = requests.request(method, url, **kwargs)
+        if response.status_code == 429:
+            if attempt < retries - 1:
+                wait = 30 * (2 ** attempt)  # 30s, 60s, 120s
+                print(f"⏳ Strava rate limit hit, waiting {wait}s before retry ({attempt + 1}/{retries})...")
+                time.sleep(wait)
+                continue
+        response.raise_for_status()
+        return response
+    # Should not reach here, but just in case
+    response.raise_for_status()
+    return response
+
+
 def get_strava_activities(access_token: str, count: int = 5) -> list:
     """Get recent Strava activities."""
-    response = requests.get(
+    response = strava_api_call(
+        "GET",
         f"{STRAVA_API_BASE}/athlete/activities",
         headers={"Authorization": f"Bearer {access_token}"},
         params={"per_page": count, "page": 1},
     )
-    response.raise_for_status()
     return response.json()
 
 
 def update_strava_activity(access_token: str, activity_id: int, new_name: str) -> dict:
     """Update a Strava activity's name."""
-    response = requests.put(
+    response = strava_api_call(
+        "PUT",
         f"{STRAVA_API_BASE}/activities/{activity_id}",
         headers={"Authorization": f"Bearer {access_token}"},
         json={"name": new_name},
     )
-    response.raise_for_status()
     return response.json()
 
 

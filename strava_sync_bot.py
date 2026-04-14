@@ -20,6 +20,7 @@ Usage:
 import logging
 import os
 import sys
+import time
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -47,9 +48,41 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ===== Global State =====
+_cached_garmin = None  # Reuse Garmin session across commands
+_last_sync_time = 0  # Timestamp of last sync for debounce
+SYNC_COOLDOWN_SECONDS = 60  # Minimum seconds between syncs
+ALLOWED_CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", "0"))
+
+
+def _is_allowed(update: Update) -> bool:
+    """Check if the message is from the allowed chat ID."""
+    chat_id = update.effective_chat.id
+    if ALLOWED_CHAT_ID and chat_id != ALLOWED_CHAT_ID:
+        logger.warning(f"Ignored message from unauthorized chat_id={chat_id}")
+        return False
+    return True
+
+
+def _get_garmin_session():
+    """Get or create a cached Garmin session. Re-initializes on failure."""
+    global _cached_garmin
+    if _cached_garmin is not None:
+        # Validate the session still works with a lightweight call
+        try:
+            _cached_garmin.get_activities(0, 1)
+            return _cached_garmin
+        except Exception:
+            logger.info("Cached Garmin session expired, re-initializing...")
+            _cached_garmin = None
+    _cached_garmin = init_garmin_api()
+    return _cached_garmin
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start command."""
+    if not _is_allowed(update):
+        return
     await update.message.reply_text(
         "🔄 *Garmin to Strava Sync Bot*\n\n"
         "Commands:\n"
@@ -62,12 +95,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /sync command - sync all Garmin activities from past 24 hours to Strava."""
+    if not _is_allowed(update):
+        return
+    global _last_sync_time
+
+    # Debounce: reject if last sync was too recent
+    elapsed = time.time() - _last_sync_time
+    if elapsed < SYNC_COOLDOWN_SECONDS:
+        remaining = int(SYNC_COOLDOWN_SECONDS - elapsed)
+        await update.message.reply_text(f"⏳ Please wait {remaining}s before syncing again.")
+        return
+
     await update.message.reply_text("🔄 Syncing activities from past 24 hours...")
+    _last_sync_time = time.time()
 
     try:
-        # Step 1: Connect to Garmin
+        # Step 1: Connect to Garmin (uses cached session)
         await update.message.reply_text("📱 Connecting to Garmin Connect...")
-        garmin = init_garmin_api()
+        garmin = _get_garmin_session()
         if not garmin:
             await update.message.reply_text("❌ Failed to connect to Garmin.")
             return
@@ -123,6 +168,7 @@ async def sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 update_strava_activity(access_token, strava_id, garmin_name)
                 synced_count += 1
                 results.append(f"🔄 {strava_name} → {garmin_name}")
+                time.sleep(1.5)  # Delay between updates to avoid Strava rate limits
             except Exception as e:
                 results.append(f"❌ {garmin_name} - Error: {e}")
 
@@ -144,12 +190,24 @@ async def sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def sync_last_10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /sync_last_10 command - sync the last 10 Garmin activities to Strava."""
+    if not _is_allowed(update):
+        return
+    global _last_sync_time
+
+    # Debounce: reject if last sync was too recent
+    elapsed = time.time() - _last_sync_time
+    if elapsed < SYNC_COOLDOWN_SECONDS:
+        remaining = int(SYNC_COOLDOWN_SECONDS - elapsed)
+        await update.message.reply_text(f"⏳ Please wait {remaining}s before syncing again.")
+        return
+
     await update.message.reply_text("🔄 Syncing last 10 activities...")
+    _last_sync_time = time.time()
 
     try:
-        # Step 1: Connect to Garmin
+        # Step 1: Connect to Garmin (uses cached session)
         await update.message.reply_text("📱 Connecting to Garmin Connect...")
-        garmin = init_garmin_api()
+        garmin = _get_garmin_session()
         if not garmin:
             await update.message.reply_text("❌ Failed to connect to Garmin.")
             return
@@ -204,6 +262,7 @@ async def sync_last_10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 update_strava_activity(access_token, strava_id, garmin_name)
                 synced_count += 1
                 results.append(f"🔄 {strava_name} → {garmin_name}")
+                time.sleep(1.5)  # Delay between updates to avoid Strava rate limits
             except Exception as e:
                 results.append(f"❌ {garmin_name} - Error")
 
